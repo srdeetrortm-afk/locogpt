@@ -7,7 +7,7 @@
 //   GROQ_MODELS       (optional)  comma list, tried in order
 //   ANTHROPIC_API_KEY (optional)  if set, Claude answers first (paid per question); Groq stays as backup
 //   ANTHROPIC_MODEL   (optional)  default claude-sonnet-5-5
-const DEFAULT_MODELS = 'meta-llama/llama-4-scout-17b-16e-instruct,llama-3.3-70b-versatile,openai/gpt-oss-120b';
+const DEFAULT_MODELS = 'openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b';
 const VISION = /llama-4|scout|maverick|vision/i;
 const tokCache = new Map();
 
@@ -30,14 +30,16 @@ async function groq(model, messages, wantJson, image) {
     const last = msgs[msgs.length - 1];
     msgs = [...msgs.slice(0, -1), { role: 'user', content: [{ type: 'text', text: String(last.content) }, { type: 'image_url', image_url: { url: image } }] }];
   }
-  const body = { model, messages: msgs, temperature: 0.2, max_tokens: 1500 };
+  const body = { model, messages: msgs, temperature: 0.2, max_tokens: 1400 };
+  if (/gpt-oss/.test(model)) body.reasoning_effort = 'low';
+  if (/qwen/.test(model)) body.reasoning_format = 'hidden';
   if (wantJson) body.response_format = { type: 'json_object' };
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST', headers: { authorization: 'Bearer ' + process.env.GROQ_API_KEY, 'content-type': 'application/json' }, body: JSON.stringify(body)
   });
   if (!r.ok) { const e = new Error('groq ' + r.status); e.status = r.status; e.detail = (await r.text()).slice(0, 300); throw e; }
   const d = await r.json();
-  return d.choices?.[0]?.message?.content || '';
+  return (d.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 }
 
 async function claude(messages, wantJson, image) {
@@ -68,12 +70,21 @@ async function gemini(messages, wantJson, image) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
   });
-  if (!r.ok) { const e = new Error('gemini ' + r.status); e.status = r.status; throw e; }
+  if (!r.ok) { const e = new Error('gemini ' + r.status); e.status = r.status; e.detail = (await r.text()).slice(0, 300); throw e; }
   const d = await r.json();
   return d.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
 }
 
 export default async (req) => {
+  if (req.method === 'GET') {
+    const out = { groqKey: !!process.env.GROQ_API_KEY, geminiKey: !!process.env.GEMINI_API_KEY, claudeKey: !!process.env.ANTHROPIC_API_KEY, login: !!process.env.GOOGLE_CLIENT_ID, models: {} };
+    const ping = [{ role: 'user', content: 'Reply with the single word OK' }];
+    if (out.groqKey) for (const m of (process.env.GROQ_MODELS || DEFAULT_MODELS).split(',').map(x => x.trim()).filter(Boolean)) {
+      try { out.models[m] = 'ok: ' + (await groq(m, ping, false, null)).slice(0, 20); } catch (e) { out.models[m] = 'error ' + (e.status || '') + ' ' + (e.detail || e.message || '').slice(0, 160); }
+    }
+    if (out.geminiKey) { try { out.models.gemini = 'ok: ' + (await gemini(ping, false, null)).slice(0, 20); } catch (e) { out.models.gemini = 'error ' + (e.status || '') + ' ' + (e.detail || '').slice(0, 160); } }
+    return json(out);
+  }
   if (req.method !== 'POST') return json({ error: 'method' }, 405);
   const cid = process.env.GOOGLE_CLIENT_ID;
   if (cid) {
@@ -88,7 +99,7 @@ export default async (req) => {
   const image = typeof body.image === 'string' && body.image.startsWith('data:image/') ? body.image : null;
   const wantJson = !!body.json;
   let models = (process.env.GROQ_MODELS || DEFAULT_MODELS).split(',').map(s => s.trim()).filter(Boolean);
-  if (image) models = models.filter(m => VISION.test(m));
+  if (image) models = models.filter(m => VISION.test(m)); // no Groq vision model today -> photo goes to Gemini
   let limited = false, lastErr = null;
   if (process.env.ANTHROPIC_API_KEY) {
     try { const text = await claude(messages, wantJson, image); if (text) return json({ text, model: 'claude' }); }
@@ -97,7 +108,7 @@ export default async (req) => {
   if (process.env.GROQ_API_KEY) {
     for (const m of models) {
       try { const text = await groq(m, messages, wantJson, image); if (text) return json({ text, model: m }); }
-      catch (e) { lastErr = e; if (e.status === 429) limited = true; }
+      catch (e) { lastErr = e; if (e.status === 429 || e.status === 413) limited = true; }
     }
   }
   if (process.env.GEMINI_API_KEY) {
